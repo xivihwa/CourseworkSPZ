@@ -38,5 +38,5 @@ SHOW_BUFFER_STATE = True         # Show buffer cache state in aggregated summary
 SHOW_QUEUE_STATE = True          # Show queue state in aggregated messages
 
 # NEW: Detailed step-by-step trace (like instructor)
-DETAILED_TRACE = True            # If True - print per-iteration trace
+DETAILED_TRACE = False            # If True - print per-iteration trace
 TIME_UNIT_MICROSECONDS = True    # If True - detailed trace prints in microseconds (us)

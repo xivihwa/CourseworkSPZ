@@ -28,6 +28,7 @@ class System:
         self.total_interrupt_time = 0.0
         self.total_process_time = 0.0
         self.completed_processes = 0
+        self.pending_disk_operations = []
     
     def _fmt_time(self, ms):
         """Format time with apostrophe grouping for thousands"""
@@ -119,7 +120,9 @@ class System:
             iteration_count += 1
             
             self._trace(f"SCHEDULER: {self._fmt_time(self.current_time)} (NEXT ITERATION)")
-            
+
+            self._process_pending_interrupts()
+
             if not self.current_process and self.ready_queue:
                 self.current_process = self.ready_queue.pop(0)
                 self.current_process.state = 'RUNNING'
@@ -138,11 +141,18 @@ class System:
             if self.current_process:
                 self._execute_process()
             
-            if self.scheduler.has_requests():
+            if self.scheduler.has_requests() and not self.pending_disk_operations:
                 self._process_disk_queue()
             
             if not self.current_process and not self.ready_queue and self.blocked_processes:
-                self.current_time += 1.0
+                if self.pending_disk_operations:
+                    next_interrupt_time = min(t for t, r in self.pending_disk_operations)
+                    if next_interrupt_time > self.current_time:
+                        self.current_time = next_interrupt_time
+                elif self.scheduler.has_requests():
+                    self._process_disk_queue()
+                else:
+                    self.current_time += 1.0
             
             if iteration_count >= max_iterations:
                 print(f"\n[WARNING] Maximum iterations reached ({max_iterations})")
@@ -160,6 +170,125 @@ class System:
             if p.state != 'FINISHED':
                 return True
         return False
+    
+    def _process_pending_interrupts(self):
+        """Process all interrupts that should occur at current_time"""
+        while self.pending_disk_operations:
+            interrupts_now = [
+                (t, r) for t, r in self.pending_disk_operations 
+                if abs(t - self.current_time) < 0.0001
+            ]
+            
+            if not interrupts_now:
+                break
+            
+            for t, request in interrupts_now:
+                self._handle_disk_interrupt(request)
+                self.pending_disk_operations.remove((t, request))
+    
+    def _advance_time_with_interrupts(self, duration):
+        """
+        Advance time by duration, handling disk interrupts that occur during this period.
+        Returns the actual time advanced (may be less than duration if interrupted).
+        """
+        if self.current_process is None:
+            self.current_time += duration
+            return duration, False
+        
+        time_used = 0.0
+        remaining_time = duration
+        process = self.current_process
+        
+        while remaining_time > 0.0001:
+            next_interrupt_time = None
+            next_interrupt_request = None
+            
+            for completion_time, request in self.pending_disk_operations:
+                time_until_interrupt = completion_time - self.current_time
+                if 0 < time_until_interrupt <= remaining_time + 0.0001:
+                    if next_interrupt_time is None or completion_time < next_interrupt_time:
+                        next_interrupt_time = completion_time
+                        next_interrupt_request = request
+            
+            time_until_quantum_exhausted = process.remaining_quantum
+            
+            if next_interrupt_time is not None:
+                time_to_interrupt = next_interrupt_time - self.current_time
+                
+                segment_time = min(time_to_interrupt, time_until_quantum_exhausted, remaining_time)
+                
+                self.current_time += segment_time
+                process.remaining_quantum -= segment_time
+                time_used += segment_time
+                remaining_time -= segment_time
+                
+                if abs(self.current_time - next_interrupt_time) < 0.0001:
+                    self._handle_disk_interrupt(next_interrupt_request)
+                    self.pending_disk_operations.remove((next_interrupt_time, next_interrupt_request))
+                    
+                    if self.current_process != process:
+                        return time_used, True
+                
+                if process.remaining_quantum <= 0.0001:
+                    return time_used, True
+                    
+            else:
+                segment_time = min(remaining_time, time_until_quantum_exhausted)
+                
+                self.current_time += segment_time
+                process.remaining_quantum -= segment_time
+                time_used += segment_time
+                remaining_time -= segment_time
+                
+                if process.remaining_quantum <= 0.0001:
+                    return time_used, True
+        
+        return time_used, False
+
+    def _handle_disk_interrupt(self, request):
+        """Handle completion of a disk I/O operation (interrupt handler)"""
+        if config.DETAILED_TRACE:
+            self._trace(f"\n>>> DISK INTERRUPT at {self._fmt_time(self.current_time)} <<<")
+            self._trace(f"SCHEDULER: Disk interrupt handler was invoked for request {request.request_id}")
+        
+        self.current_time += config.INTERRUPT_HANDLER_TIME
+        self.total_interrupt_time += config.INTERRUPT_HANDLER_TIME
+        
+        if self.current_process is not None:
+            self.current_process.remaining_quantum -= config.INTERRUPT_HANDLER_TIME
+        
+        request.time_completed = self.current_time
+        
+        cache_buffer = self.cache.find_buffer(request.sector)
+        if cache_buffer and request.is_write:
+            cache_buffer.is_dirty = False
+            if config.DETAILED_TRACE:
+                self._trace(f"  [CACHE] Buffer {cache_buffer.buffer_id} (sector {cache_buffer.sector}) marked CLEAN after write")
+        
+        if config.DETAILED_TRACE:
+            self._print_cache_state()
+        
+        if request.process_id in self.blocked_processes:
+            blocked_request, time_blocked = self.blocked_processes[request.process_id]
+            del self.blocked_processes[request.process_id]
+            
+            for p in self.processes:
+                if p.pid == request.process_id:
+                    p.state = 'READY'
+                    p.waiting_for_io = False
+                    p.io_request = None
+                    p.ready_since = self.current_time
+                    
+                    io_time = self.current_time - time_blocked
+                    p.total_io_time += io_time
+                    
+                    self.ready_queue.append(p)
+                    
+                    if config.DETAILED_TRACE:
+                        self._trace(f"         Process {p.name} UNBLOCKED, I/O time: {self._fmt_time(io_time)}")
+                    if config.VERBOSE:
+                        print(f"         Process {p.name} UNBLOCKED, I/O time: {io_time:.2f} ms")
+                    break
     
     def _execute_process(self):
         """Executes current process (single quantum or until blocked)"""
@@ -188,15 +317,31 @@ class System:
             self._trace(f"SCHEDULER: Kernel mode (syscall) for process `{process.name}`")
         
         syscall_time = config.SYSCALL_WRITE_TIME if is_write else config.SYSCALL_READ_TIME
-        self.current_time += syscall_time
-        process.remaining_quantum -= syscall_time
-        process.total_cpu_time += syscall_time
-        self.total_syscall_time += syscall_time
+        
+        actual_syscall_time, was_interrupted = self._advance_time_with_interrupts(syscall_time)
+        
+        process.total_cpu_time += actual_syscall_time
+        self.total_syscall_time += actual_syscall_time
         
         if config.DETAILED_TRACE:
-            self._trace(f"... worked for {self._fmt_time(syscall_time)} in system call, request buffer cache")
+            self._trace(f"... worked for {self._fmt_time(actual_syscall_time)} in system call, request buffer cache")
         
-        buffer, is_hit, need_disk_read = self.cache.access_buffer(sector, is_write, trace_func=self._trace if config.DETAILED_TRACE else None)
+        if self.current_process is None or self.current_process != process:
+            return
+        
+        if was_interrupted or process.remaining_quantum <= 0.0001:
+            process.state = 'READY'
+            process.ready_since = self.current_time
+            self.ready_queue.append(process)
+            self.current_process = None
+            if config.DETAILED_TRACE:
+                self._trace(f"SCHEDULER: Time quantum exhausted for process `{process.name}` (during syscall)")
+            return
+        
+        buffer, is_hit, need_disk_read = self.cache.access_buffer(
+            sector, is_write, 
+            trace_func=self._trace if config.DETAILED_TRACE else None
+        )
         
         if config.DETAILED_TRACE:
             self._print_cache_state()
@@ -243,8 +388,7 @@ class System:
                     self._trace(f"    direct move time {d} us, move time with rewind {be} us")
                 else:
                     self._trace(f"DRIVER: Best move decision for tracks {self.disk.current_track} => ({b.buffer_id}:{b.sector}) (next buffer in queue)")
-                    self._trace(f"    not to move, that is 0 us")
-                
+                    self._trace(f"    not to move, that is 0 us")            
             process.state = 'BLOCKED'
             process.waiting_for_io = True
             process.io_request = request
@@ -253,25 +397,25 @@ class System:
             if config.DETAILED_TRACE:
                 self._trace(f"SCHEDULER: Block process `{process.name}`")
                 predicted = (self.disk.calculate_seek_time(request.track)
-                             + config.ROTATION_LATENCY + config.SECTOR_RW_TIME + config.INTERRUPT_HANDLER_TIME)
+                            + config.ROTATION_LATENCY + config.SECTOR_RW_TIME + config.INTERRUPT_HANDLER_TIME)
                 self._trace(f"SCHEDULER: Next interrupt from disk will be at {self._fmt_time(self.current_time + predicted)}")
             
             self.current_process = None
         else:
-            if is_write:
-                process_time = config.PROCESS_WRITE_TIME
-            else:
-                process_time = config.PROCESS_READ_TIME
+            process_time = config.PROCESS_WRITE_TIME if is_write else config.PROCESS_READ_TIME
             
             if config.DETAILED_TRACE:
                 self._trace(f"... data in cache, processing for {self._fmt_time(process_time)}")
             
-            self.current_time += process_time
-            process.remaining_quantum -= process_time
-            process.total_cpu_time += process_time
-            self.total_process_time += process_time
+            actual_process_time, was_interrupted = self._advance_time_with_interrupts(process_time)
             
-            if process.remaining_quantum <= 0:
+            process.total_cpu_time += actual_process_time
+            self.total_process_time += actual_process_time
+            
+            if self.current_process is None or self.current_process != process:
+                return
+            
+            if was_interrupted or process.remaining_quantum <= 0.0001:
                 process.state = 'READY'
                 process.ready_since = self.current_time
                 self.ready_queue.append(process)
@@ -283,7 +427,13 @@ class System:
                     self._trace(f"SCHEDULER: Time quantum exhausted for process `{process.name}`")
     
     def _process_disk_queue(self):
-        """Processes disk request queue (handle one request per call)"""
+        """
+        Start processing a disk request if disk is idle.
+        The actual completion will be handled by interrupt during _advance_time_with_interrupts.
+        """
+        if self.pending_disk_operations:
+            return
+        
         if not self.scheduler.has_requests():
             return
         
@@ -292,48 +442,31 @@ class System:
             return
         
         if config.DETAILED_TRACE:
-            self._trace(f"\nSCHEDULER: {self._fmt_time(self.current_time)} (DISK HANDLING)")
-            self._trace(f"SCHEDULER: Disk interrupt handler was invoked")
+            self._trace(f"\nSCHEDULER: {self._fmt_time(self.current_time)} (STARTING DISK I/O)")
         
-        disk_time = self.disk.execute_request(request, self.current_time, trace_func=self._trace if config.DETAILED_TRACE else None)
+        seek_time = self.disk.calculate_seek_time(request.track)
+        self.disk.total_seek_time += seek_time
         
-        self.current_time += disk_time
+        rotational_latency = config.ROTATION_LATENCY
+        self.disk.total_rotational_latency += rotational_latency
         
-        self.current_time += config.INTERRUPT_HANDLER_TIME
-        self.total_interrupt_time += config.INTERRUPT_HANDLER_TIME
+        transfer_time = config.SECTOR_RW_TIME
+        self.disk.total_transfer_time += transfer_time
         
-        request.time_completed = self.current_time
+        total_disk_time = seek_time + rotational_latency + transfer_time
         
-        cache_buffer = self.cache.find_buffer(request.sector)
-        if cache_buffer and request.is_write:
-            cache_buffer.is_dirty = False
-            if config.DETAILED_TRACE:
-                self._trace(f"  [CACHE] Buffer {cache_buffer.buffer_id} (sector {cache_buffer.sector}) marked CLEAN after write")
+        self.disk.current_track = request.track
+        self.disk.completed_requests += 1
         
         if config.DETAILED_TRACE:
-            self._print_cache_state()
+            self._trace(f"  [DISK] Starting {request}")
+            self._trace(f"         Seek time: {seek_time:.2f} ms, Rotation latency: {rotational_latency:.2f} ms, "
+                       f"Transfer: {transfer_time:.2f} ms")
+            self._trace(f"         Total time: {total_disk_time:.2f} ms, Current track: {self.disk.current_track}")
+            self._trace(f"         Interrupt will occur at {self._fmt_time(self.current_time + total_disk_time)}")
         
-        if request.process_id in self.blocked_processes:
-            blocked_request, time_blocked = self.blocked_processes[request.process_id]
-            del self.blocked_processes[request.process_id]
-            
-            for p in self.processes:
-                if p.pid == request.process_id:
-                    p.state = 'READY'
-                    p.waiting_for_io = False
-                    p.io_request = None
-                    p.ready_since = self.current_time
-                    
-                    io_time = self.current_time - time_blocked
-                    p.total_io_time += io_time
-                    
-                    self.ready_queue.append(p)
-                    
-                    if config.DETAILED_TRACE:
-                        self._trace(f"         Process {p.name} UNBLOCKED, I/O time: {self._fmt_time(io_time)}")
-                    if config.VERBOSE:
-                        print(f"         Process {p.name} UNBLOCKED, I/O time: {io_time:.2f} ms")
-                    break
+        completion_time = self.current_time + total_disk_time
+        self.pending_disk_operations.append((completion_time, request))
     
     def _flush_cache_if_needed(self):
         """Flush dirty buffers (write-back) at simulation end"""
@@ -355,6 +488,10 @@ class System:
         
         while self.scheduler.has_requests():
             self._process_disk_queue()
+            if self.pending_disk_operations:
+                next_time = min(t for t, r in self.pending_disk_operations)
+                self.current_time = next_time
+                self._process_pending_interrupts()
         
         for b in list(dirty):
             self.cache.remove_buffer_from_cache(b, trace_func=self._trace if config.DETAILED_TRACE else None)
@@ -409,6 +546,7 @@ class System:
         self.ready_queue = []
         self.current_process = None
         self.blocked_processes = {}
+        self.pending_disk_operations = []
         
         for p in self.processes:
             p.reset()
